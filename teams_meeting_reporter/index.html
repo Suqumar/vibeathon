@@ -1,1 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Teams Attendance Cumulative Report Generator</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+    .cross { color: red; font-weight: bold; text-align: center; }
+    .tick { color: green; font-weight: bold; text-align: center; }
+    button {
+      margin-top: 10px;
+      margin-right: 10px;
+      padding: 10px 15px;
+      font-weight: bold;
+      background-color: #007bff;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    /* hide the meeting-name block until files are selected */
+    #meetingNameContainer {
+      display: none;
+      margin-top: 10px;
+    }
+    /* input styling only */
+    #meetingNameInput {
+      padding: 5px;
+      width: 500px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Meeting Attendance Report Generator</h1>
 
+  <div style="margin-bottom: 20px; max-width: 700px;">
+    <h3>Description</h3>
+    <p>This tool allows you to upload multiple <strong>Microsoft Teams</strong> meeting attendance CSV files and generates a cumulative report.</p>
+    <p><strong>Note:</strong> Data is processed entirely in your browser. Nothing is uploaded or saved externally.</p>
+  </div>
+
+  <h2>Upload Teams Attendance CSV Files</h2>
+  <input type="file" id="fileInput" multiple accept=".csv">
+
+  <!-- Hidden until after upload -->
+  <div id="meetingNameContainer">
+    <label for="meetingNameInput"><strong>Meeting Name:</strong></label><br>
+    <input type="text" id="meetingNameInput" placeholder="Meeting Name will appear here...">
+  </div>
+
+  <button id="pdfDownloadBtn" style="display:none;">Download PDF Report</button>
+  <button id="exportCSVBtn" style="display:none;">Download CSV Report</button>
+  <button id="exportExcelBtn" style="display:none;">Download Excel Report</button>
+
+  <div id="reportContainer">
+    <div id="summaryLine"></div>
+    <div id="report1"></div>
+    <div id="report2"></div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const meetingNameContainer = document.getElementById('meetingNameContainer');
+    const meetingNameInput = document.getElementById('meetingNameInput');
+    const pdfDownloadBtn = document.getElementById('pdfDownloadBtn');
+    const exportCSVBtn = document.getElementById('exportCSVBtn');
+    const exportExcelBtn = document.getElementById('exportExcelBtn');
+    const report1Div = document.getElementById('report1');
+    const report2Div = document.getElementById('report2');
+    const summaryLineDiv = document.getElementById('summaryLine');
+
+    fileInput.addEventListener('change', async (event) => {
+      const files = Array.from(event.target.files);
+      if (!files.length) return;
+
+      // Show meeting-name block and export buttons
+      meetingNameContainer.style.display = 'block';
+      pdfDownloadBtn.style.display = 'inline-block';
+      exportCSVBtn.style.display = 'inline-block';
+      exportExcelBtn.style.display = 'inline-block';
+
+      const meetingDates = new Set();
+      const participantsMap = new Map();
+      const attendanceLog = new Map();
+      const allParticipants = new Set();
+
+      // Pick latest file name for default meeting name
+      files.sort((a, b) => b.lastModified - a.lastModified);
+      const latestFileName = files[0].name;
+      meetingNameInput.value = latestFileName.replace(/\.[^/.]+$/, "");
+
+      for (let file of files) {
+        const text = await file.text();
+        const lines = text.split(/\r?\n/);
+
+        // Extract date from the "1. Summary" section
+        const startIdx = lines.findIndex(line => line.includes('1. Summary'));
+        const dateLine = lines[startIdx + 2] || '';
+        const match = dateLine.match(/"?(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+        let meetingDate = file.name;
+        if (match) {
+          const mm = match[1].padStart(2, '0');
+          const dd = match[2].padStart(2, '0');
+          const yyyy = match[3].length === 2 ? '20' + match[3] : match[3];
+          meetingDate = `${yyyy}-${mm}-${dd}`;
+        }
+        meetingDates.add(meetingDate);
+
+        // Find Participants section
+        let start = lines.findIndex(line => line.includes('2. Participants'));
+        if (start === -1) continue;
+        start += 2;
+
+        const dailyDurations = {};
+        while (start < lines.length && lines[start].trim()) {
+          const parts = lines[start].split('\t');
+          if (parts.length < 7) break;
+          const rawName = parts[0].trim();
+          const durationStr = parts[3].trim();
+          const email = parts[4].trim();
+
+          // Skip internal system accounts
+          if (email.toLowerCase().endsWith('tinymagiq.com')) {
+            start++;
+            continue;
+          }
+
+          const tags = (rawName.match(/\(([^)]+)\)/g) || []).map(t => t.slice(1,-1));
+          const cleanedName = rawName
+            .replace(/\(([^)]+)\)/g, '')
+            .replace(/\b(External|Unverified)\b/gi, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          const effectiveEmail = email || tags.join(', ');
+          const key = email || cleanedName;
+          const mins = parseDurationToMinutes(durationStr);
+
+          dailyDurations[key] = (dailyDurations[key] || 0) + mins;
+          if (!participantsMap.has(key)) {
+            participantsMap.set(key, { name: cleanedName, email: effectiveEmail, attended: 0 });
+          }
+          attendanceLog.has(key) || attendanceLog.set(key, {});
+          start++;
+        }
+
+        // Tally attendance
+        for (let key in dailyDurations) {
+          allParticipants.add(key);
+          attendanceLog.get(key)[meetingDate] = (attendanceLog.get(key)[meetingDate] || 0) + dailyDurations[key];
+          if (dailyDurations[key] >= 10) {
+            participantsMap.get(key).attended++;
+          }
+        }
+
+        // Ensure every participant has an entry for this date
+        for (let key of allParticipants) {
+          if (!participantsMap.has(key)) {
+            participantsMap.set(key, { name: key, email: '', attended: 0 });
+          }
+          attendanceLog.has(key) || attendanceLog.set(key, {});
+          attendanceLog.get(key)[meetingDate] = attendanceLog.get(key)[meetingDate] || 0;
+        }
+      }
+
+      // Render summary
+      summaryLineDiv.innerHTML = `<p><strong>Total meetings:</strong> ${meetingDates.size}</p>`;
+
+      // Prepare "Meeting Attendance Summary" table
+      const sorted = Array.from(participantsMap.entries())
+        .sort((a, b) => a[1].name.localeCompare(b[1].name));
+      const totalMeetings = meetingDates.size;
+      let tbl1 = `<h3>Meeting Attendance Summary</h3>
+        <table>
+          <tr>
+            <th>S.No</th><th>Name</th><th>Email</th>
+            <th>Meetings Attended</th><th>Meetings Missed</th>
+            <th>Meetings Attended (%)</th>
+          </tr>`;
+      let idx = 1;
+      for (let [key, p] of sorted) {
+        const missed = totalMeetings - p.attended;
+        const pct = ((p.attended / totalMeetings) * 100).toFixed(2);
+        tbl1 += `<tr>
+          <td>${idx++}</td>
+          <td>${p.name}</td>
+          <td>${p.email}</td>
+          <td>${p.attended}</td>
+          <td>${missed}</td>
+          <td>${pct}%</td>
+        </tr>`;
+      }
+      tbl1 += `</table>`;
+      report1Div.innerHTML = `<h2>${meetingNameInput.value}</h2>` + tbl1;
+
+      // Prepare "Attendance Duration Matrix"
+      const dates = Array.from(meetingDates).sort();
+      const headers = dates.map(d => `<th>${d}</th>`).join('');
+      const participants = Array.from(allParticipants)
+        .sort((a, b) => participantsMap.get(a).name.localeCompare(participantsMap.get(b).name));
+      let tbl2 = `<h3>Attendance Duration Matrix</h3>
+        <table>
+          <tr><th>S.No</th><th>Name</th><th>Email</th>${headers}</tr>`;
+      let s = 1;
+      for (let key of participants) {
+        const p = participantsMap.get(key);
+        tbl2 += `<tr>
+          <td>${s++}</td>
+          <td>${p.name}</td>
+          <td>${p.email}</td>`;
+        for (let d of dates) {
+          const m = attendanceLog.get(key)[d];
+          tbl2 += m
+            ? `<td>${formatMinutes(m)}</td>`
+            : `<td class="cross">&#10060;</td>`;
+        }
+        tbl2 += `</tr>`;
+      }
+      tbl2 += `</table>`;
+      report2Div.innerHTML = `<h2>${meetingNameInput.value}</h2>` + tbl2;
+    });
+
+    function parseDurationToMinutes(str) {
+      let m = 0;
+      const h = str.match(/(\d+)h/);
+      const mm = str.match(/(\d+)m/);
+      const s = str.match(/(\d+)s/);
+      if (h) m += +h[1] * 60;
+      if (mm) m += +mm[1];
+      if (s) m += +s[1] / 60;
+      return m;
+    }
+    function formatMinutes(mins) {
+      const h = Math.floor(mins / 60);
+      const m = Math.floor(mins % 60);
+      const sec = Math.round((mins - Math.floor(mins)) * 60);
+      return `${h > 0 ? h + 'h ' : ''}${m}m ${sec}s`;
+    }
+
+    pdfDownloadBtn.addEventListener('click', () => {
+      const name = meetingNameInput.value || 'Meeting_Report';
+      const el = document.createElement('div');
+      el.innerHTML = `<h1>${name}</h1>` + document.getElementById('reportContainer').innerHTML;
+      html2pdf().set({
+        margin: 0.5,
+        filename: `${name.replace(/\s+/g, '_')}_report.pdf`,
+        image: { type: 'jpeg', quality: 0.98 },
+        html2canvas: { scale: 2 },
+        jsPDF: { unit: 'in', format: [20, 20], orientation: 'landscape' }
+      }).from(el).save();
+    });
+
+    exportCSVBtn.addEventListener('click', () => exportAllTablesToCSV('full_attendance_report.csv'));
+
+    exportExcelBtn.addEventListener('click', () => {
+      const wb = XLSX.utils.book_new();
+      const rows = [];
+      
+      // Prepare the first table (Meeting Attendance Summary)
+      const table1 = document.querySelector('#report1 table');
+      table1.querySelectorAll('tr').forEach((row, rowIndex) => {
+        const rowData = [];
+        row.querySelectorAll('th, td').forEach((cell, cellIndex) => {
+          if (cellIndex === 5) { // Percentage column
+            const pct = cell.innerText.trim();
+            rowData.push(pct.includes('%') ? pct : `${pct}%`); // Add '%' if not already present
+          } else {
+            rowData.push(cell.innerText.trim());
+          }
+        });
+        rows.push(rowData.join(','));
+      });
+
+      // Create a worksheet for the table and append it to the workbook
+      const ws1 = XLSX.utils.aoa_to_sheet(rows.map(row => row.split(',')));
+      XLSX.utils.book_append_sheet(wb, ws1, 'Attendance Summary');
+
+      // Prepare the second table (Attendance Duration Matrix)
+      const table2 = document.querySelector('#report2 table');
+      const rows2 = [];
+      table2.querySelectorAll('tr').forEach((row, rowIndex) => {
+        const rowData = [];
+        row.querySelectorAll('th, td').forEach((cell, cellIndex) => {
+          if (cellIndex === 5) { // Handle percentage column if needed
+            const pct = cell.innerText.trim();
+            rowData.push(pct.includes('%') ? pct : `${pct}%`); // Add '%' if not already present
+          } else {
+            rowData.push(cell.innerText.trim());
+          }
+        });
+        rows2.push(rowData);
+      });
+
+      // Add the second worksheet
+      const ws2 = XLSX.utils.aoa_to_sheet(rows2);
+      XLSX.utils.book_append_sheet(wb, ws2, 'Duration Matrix');
+
+      // Save the workbook with the proper filename
+      XLSX.writeFile(wb, `${meetingNameInput.value}_attendance_report.xlsx`);
+    });
+
+  </script>
+</body>
+</html>
